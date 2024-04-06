@@ -445,7 +445,8 @@ public:
 
     /* Gets the keyboard layout for a particular input device. */
     virtual std::shared_ptr<KeyCharacterMap> getKeyboardLayoutOverlay(
-            const InputDeviceIdentifier& identifier) = 0;
+            const InputDeviceIdentifier& identifier,
+            const std::optional<KeyboardLayoutInfo> keyboardLayoutInfo) = 0;
 
     /* Gets a user-supplied alias for a particular input device, or an empty string if none. */
     virtual std::string getDeviceAlias(const InputDeviceIdentifier& identifier) = 0;
@@ -455,6 +456,18 @@ public:
             const std::string& inputDeviceDescriptor, ui::Rotation surfaceRotation) = 0;
     /* Notifies the input reader policy that a stylus gesture has started. */
     virtual void notifyStylusGestureStarted(int32_t deviceId, nsecs_t eventTime) = 0;
+
+    /* Returns true if any InputConnection is currently active. */
+    virtual bool isInputMethodConnectionActive() = 0;
+
+    /* Gets the viewport of a particular display that the pointer device is associated with. If
+     * the pointer device is not associated with any display, it should ADISPLAY_IS_NONE to get
+     * the viewport that should be used. The device should get a new viewport using this method
+     * every time there is a display configuration change. The logical bounds of the viewport should
+     * be used as the range of possible values for pointing devices, like mice and touchpads.
+     */
+    virtual std::optional<DisplayViewport> getPointerViewportForAssociatedDisplay(
+            int32_t associatedDisplayId = ADISPLAY_ID_NONE) = 0;
 };
 
 } // namespace android

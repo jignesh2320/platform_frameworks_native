@@ -210,6 +210,7 @@ int PropertiesHelper::parallel_run_ = -1;
 #if !defined(__ANDROID_VNDK__)
 int PropertiesHelper::strict_run_ = -1;
 #endif
+int PropertiesHelper::strict_run_ = -1;
 
 bool PropertiesHelper::IsUserBuild() {
     if (build_type_.empty()) {

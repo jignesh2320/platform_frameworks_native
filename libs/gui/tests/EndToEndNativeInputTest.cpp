@@ -24,6 +24,7 @@
 
 #include <memory>
 
+#include <android/gui/BnWindowInfosReportedListener.h>
 #include <android/keycodes.h>
 #include <android/native_window.h>
 
@@ -73,6 +74,26 @@ sp<IInputFlinger> getInputFlinger() {
 // We use the top 10 layers as a way to haphazardly place ourselves above anything else.
 static const int LAYER_BASE = INT32_MAX - 10;
 static constexpr std::chrono::nanoseconds DISPATCHING_TIMEOUT = 5s;
+
+class SynchronousWindowInfosReportedListener : public gui::BnWindowInfosReportedListener {
+public:
+    binder::Status onWindowInfosReported() override {
+        std::lock_guard<std::mutex> lock{mMutex};
+        mWindowInfosReported = true;
+        mConditionVariable.notify_one();
+        return binder::Status::ok();
+    }
+
+    void wait() {
+        std::unique_lock<std::mutex> lock{mMutex};
+        mConditionVariable.wait(lock, [&] { return mWindowInfosReported; });
+    }
+
+private:
+    std::mutex mMutex;
+    std::condition_variable mConditionVariable;
+    bool mWindowInfosReported{false};
+};
 
 class InputSurface {
 public:
@@ -264,7 +285,10 @@ public:
         t.setPosition(mSurfaceControl, x, y);
         t.setCrop(mSurfaceControl, crop);
         t.setAlpha(mSurfaceControl, 1);
-        t.apply(true);
+        auto reportedListener = sp<SynchronousWindowInfosReportedListener>::make();
+        t.addWindowInfosReportedListener(reportedListener);
+        t.apply();
+        reportedListener->wait();
     }
 
     void requestFocus(int displayId = ADISPLAY_ID_DEFAULT) {
@@ -370,7 +394,7 @@ public:
         // After a new buffer is queued, SurfaceFlinger is notified and will
         // latch the new buffer on next vsync.  Let's heuristically wait for 3
         // vsyncs.
-        mBufferPostDelay = static_cast<int32_t>(1e6 / mode.refreshRate) * 3;
+        mBufferPostDelay = static_cast<int32_t>(1e6 / mode.peakRefreshRate) * 3;
     }
 
     void TearDown() {
@@ -821,7 +845,7 @@ TEST_F(InputSurfacesTest, touch_flag_obscured) {
     // with flag AMOTION_EVENT_FLAG_WINDOW_IS_OBSCURED
     std::unique_ptr<InputSurface> nonTouchableSurface = makeSurface(100, 100);
     nonTouchableSurface->mInputInfo.setInputConfig(WindowInfo::InputConfig::NOT_TOUCHABLE, true);
-    nonTouchableSurface->mInputInfo.ownerUid = 22222;
+    nonTouchableSurface->mInputInfo.ownerUid = gui::Uid{22222};
     // Overriding occlusion mode otherwise the touch would be discarded at InputDispatcher by
     // the default obscured/untrusted touch filter introduced in S.
     nonTouchableSurface->mInputInfo.touchOcclusionMode = TouchOcclusionMode::ALLOW;
@@ -842,8 +866,8 @@ TEST_F(InputSurfacesTest, touch_flag_partially_obscured_with_crop) {
     std::unique_ptr<InputSurface> nonTouchableSurface = makeSurface(100, 100);
     nonTouchableSurface->mInputInfo.setInputConfig(WindowInfo::InputConfig::NOT_TOUCHABLE, true);
     parentSurface->mInputInfo.setInputConfig(WindowInfo::InputConfig::NOT_TOUCHABLE, true);
-    nonTouchableSurface->mInputInfo.ownerUid = 22222;
-    parentSurface->mInputInfo.ownerUid = 22222;
+    nonTouchableSurface->mInputInfo.ownerUid = gui::Uid{22222};
+    parentSurface->mInputInfo.ownerUid = gui::Uid{22222};
     nonTouchableSurface->showAt(0, 0);
     parentSurface->showAt(100, 100);
 
@@ -866,8 +890,8 @@ TEST_F(InputSurfacesTest, touch_not_obscured_with_crop) {
     std::unique_ptr<InputSurface> nonTouchableSurface = makeSurface(100, 100);
     nonTouchableSurface->mInputInfo.setInputConfig(WindowInfo::InputConfig::NOT_TOUCHABLE, true);
     parentSurface->mInputInfo.setInputConfig(WindowInfo::InputConfig::NOT_TOUCHABLE, true);
-    nonTouchableSurface->mInputInfo.ownerUid = 22222;
-    parentSurface->mInputInfo.ownerUid = 22222;
+    nonTouchableSurface->mInputInfo.ownerUid = gui::Uid{22222};
+    parentSurface->mInputInfo.ownerUid = gui::Uid{22222};
     nonTouchableSurface->showAt(0, 0);
     parentSurface->showAt(50, 50);
 
@@ -886,7 +910,7 @@ TEST_F(InputSurfacesTest, touch_not_obscured_with_zero_sized_bql) {
     std::unique_ptr<InputSurface> bufferSurface =
             InputSurface::makeBufferInputSurface(mComposerClient, 0, 0);
     bufferSurface->mInputInfo.setInputConfig(WindowInfo::InputConfig::NOT_TOUCHABLE, true);
-    bufferSurface->mInputInfo.ownerUid = 22222;
+    bufferSurface->mInputInfo.ownerUid = gui::Uid{22222};
 
     surface->showAt(10, 10);
     bufferSurface->showAt(50, 50, Rect::EMPTY_RECT);
@@ -901,7 +925,7 @@ TEST_F(InputSurfacesTest, touch_not_obscured_with_zero_sized_blast) {
     std::unique_ptr<BlastInputSurface> bufferSurface =
             BlastInputSurface::makeBlastInputSurface(mComposerClient, 0, 0);
     bufferSurface->mInputInfo.setInputConfig(WindowInfo::InputConfig::NOT_TOUCHABLE, true);
-    bufferSurface->mInputInfo.ownerUid = 22222;
+    bufferSurface->mInputInfo.ownerUid = gui::Uid{22222};
 
     surface->showAt(10, 10);
     bufferSurface->showAt(50, 50, Rect::EMPTY_RECT);
@@ -948,13 +972,13 @@ TEST_F(InputSurfacesTest, strict_unobscured_input_scaled_without_crop_window) {
 
 TEST_F(InputSurfacesTest, strict_unobscured_input_obscured_window) {
     std::unique_ptr<InputSurface> surface = makeSurface(100, 100);
-    surface->mInputInfo.ownerUid = 11111;
+    surface->mInputInfo.ownerUid = gui::Uid{11111};
     surface->doTransaction(
             [&](auto &t, auto &sc) { t.setDropInputMode(sc, gui::DropInputMode::OBSCURED); });
     surface->showAt(100, 100);
     std::unique_ptr<InputSurface> obscuringSurface = makeSurface(100, 100);
     obscuringSurface->mInputInfo.setInputConfig(WindowInfo::InputConfig::NOT_TOUCHABLE, true);
-    obscuringSurface->mInputInfo.ownerUid = 22222;
+    obscuringSurface->mInputInfo.ownerUid = gui::Uid{22222};
     obscuringSurface->showAt(100, 100);
     injectTap(101, 101);
     EXPECT_EQ(surface->consumeEvent(100), nullptr);
@@ -967,13 +991,13 @@ TEST_F(InputSurfacesTest, strict_unobscured_input_obscured_window) {
 
 TEST_F(InputSurfacesTest, strict_unobscured_input_partially_obscured_window) {
     std::unique_ptr<InputSurface> surface = makeSurface(100, 100);
-    surface->mInputInfo.ownerUid = 11111;
+    surface->mInputInfo.ownerUid = gui::Uid{11111};
     surface->doTransaction(
             [&](auto &t, auto &sc) { t.setDropInputMode(sc, gui::DropInputMode::OBSCURED); });
     surface->showAt(100, 100);
     std::unique_ptr<InputSurface> obscuringSurface = makeSurface(100, 100);
     obscuringSurface->mInputInfo.setInputConfig(WindowInfo::InputConfig::NOT_TOUCHABLE, true);
-    obscuringSurface->mInputInfo.ownerUid = 22222;
+    obscuringSurface->mInputInfo.ownerUid = gui::Uid{22222};
     obscuringSurface->showAt(190, 190);
 
     injectTap(101, 101);

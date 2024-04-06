@@ -26,6 +26,7 @@
 #include <android/gui/IWindowInfosListener.h>
 #include <android/gui/TrustedPresentationThresholds.h>
 #include <android/os/IInputConstants.h>
+#include <gui/FrameRateUtils.h>
 #include <gui/TraceUtils.h>
 #include <utils/Errors.h>
 #include <utils/Log.h>
@@ -59,7 +60,7 @@
 #include <private/gui/ComposerServiceAIDL.h>
 
 // This server size should always be smaller than the server cache size
-#define BUFFER_CACHE_MAX_SIZE 64
+#define BUFFER_CACHE_MAX_SIZE 4096
 
 namespace android {
 
@@ -377,7 +378,6 @@ void TransactionCompletedListener::onTransactionCompleted(ListenerStats listener
             }
             auto& [callbackFunction, callbackSurfaceControls] = callbacksMap[callbackId];
             if (!callbackFunction) {
-                ALOGE("cannot call null callback function, skipping");
                 continue;
             }
             std::vector<SurfaceControlStats> surfaceControlStats;
@@ -394,6 +394,11 @@ void TransactionCompletedListener::onTransactionCompleted(ListenerStats listener
 
             callbackFunction(transactionStats.latchTime, transactionStats.presentFence,
                              surfaceControlStats);
+
+            // More than one transaction may contain the same callback id. Erase the callback from
+            // the map to ensure that it is only called once. This can happen if transactions are
+            // parcelled out of process and applied in both processes.
+            callbacksMap.erase(callbackId);
         }
 
         // handle on complete callbacks
@@ -446,7 +451,9 @@ void TransactionCompletedListener::onTransactionCompleted(ListenerStats listener
             callbackFunction(transactionStats.latchTime, transactionStats.presentFence,
                              surfaceControlStats);
         }
+    }
 
+    for (const auto& transactionStats : listenerStats.transactionStats) {
         for (const auto& surfaceStats : transactionStats.surfaceStats) {
             // The callbackMap contains the SurfaceControl object, which we need to look up the
             // layerId. Since we don't know which callback contains the SurfaceControl, iterate
@@ -1027,7 +1034,7 @@ void SurfaceComposerClient::Transaction::clear() {
     mEarlyWakeupEnd = false;
     mDesiredPresentTime = 0;
     mIsAutoTimestamp = true;
-    clearFrameTimelineInfo(mFrameTimelineInfo);
+    mFrameTimelineInfo = {};
     mApplyToken = nullptr;
     mMergedTransactionIds.clear();
 }
@@ -1220,7 +1227,7 @@ status_t SurfaceComposerClient::Transaction::apply(bool synchronous, bool oneWay
         flags |= ISurfaceComposer::eEarlyWakeupEnd;
     }
 
-    sp<IBinder> applyToken = mApplyToken ? mApplyToken : sApplyToken;
+    sp<IBinder> applyToken = mApplyToken ? mApplyToken : getDefaultApplyToken();
 
     sp<ISurfaceComposer> sf(ComposerService::getComposerService());
     sf->setTransactionState(mFrameTimelineInfo, composerStates, displayStates, flags, applyToken,
@@ -1242,11 +1249,15 @@ status_t SurfaceComposerClient::Transaction::apply(bool synchronous, bool oneWay
 
 sp<IBinder> SurfaceComposerClient::Transaction::sApplyToken = new BBinder();
 
+std::mutex SurfaceComposerClient::Transaction::sApplyTokenMutex;
+
 sp<IBinder> SurfaceComposerClient::Transaction::getDefaultApplyToken() {
+    std::scoped_lock lock{sApplyTokenMutex};
     return sApplyToken;
 }
 
 void SurfaceComposerClient::Transaction::setDefaultApplyToken(sp<IBinder> applyToken) {
+    std::scoped_lock lock{sApplyTokenMutex};
     sApplyToken = applyToken;
 }
 
@@ -1269,7 +1280,7 @@ sp<IBinder> SurfaceComposerClient::createDisplay(const String8& displayName, boo
     sp<IBinder> display = nullptr;
     binder::Status status =
             ComposerServiceAIDL::getComposerService()->createDisplay(std::string(
-                                                                             displayName.string()),
+                                                                             displayName.c_str()),
                                                                      secure, requestedRefereshRate,
                                                                      &display);
     return status.isOk() ? display : nullptr;
@@ -1300,6 +1311,13 @@ sp<IBinder> SurfaceComposerClient::getPhysicalDisplayToken(PhysicalDisplayId dis
             ComposerServiceAIDL::getComposerService()->getPhysicalDisplayToken(displayId.value,
                                                                                &display);
     return status.isOk() ? display : nullptr;
+}
+
+std::optional<gui::StalledTransactionInfo> SurfaceComposerClient::getStalledTransactionInfo(
+        pid_t pid) {
+    std::optional<gui::StalledTransactionInfo> result;
+    ComposerServiceAIDL::getComposerService()->getStalledTransactionInfo(pid, &result);
+    return result;
 }
 
 void SurfaceComposerClient::Transaction::setAnimationTransaction() {
@@ -2079,6 +2097,32 @@ SurfaceComposerClient::Transaction::setDefaultFrameRateCompatibility(const sp<Su
     return *this;
 }
 
+SurfaceComposerClient::Transaction& SurfaceComposerClient::Transaction::setFrameRateCategory(
+        const sp<SurfaceControl>& sc, int8_t category, bool smoothSwitchOnly) {
+    layer_state_t* s = getLayerState(sc);
+    if (!s) {
+        mStatus = BAD_INDEX;
+        return *this;
+    }
+    s->what |= layer_state_t::eFrameRateCategoryChanged;
+    s->frameRateCategory = category;
+    s->frameRateCategorySmoothSwitchOnly = smoothSwitchOnly;
+    return *this;
+}
+
+SurfaceComposerClient::Transaction&
+SurfaceComposerClient::Transaction::setFrameRateSelectionStrategy(const sp<SurfaceControl>& sc,
+                                                                  int8_t strategy) {
+    layer_state_t* s = getLayerState(sc);
+    if (!s) {
+        mStatus = BAD_INDEX;
+        return *this;
+    }
+    s->what |= layer_state_t::eFrameRateSelectionStrategyChanged;
+    s->frameRateSelectionStrategy = strategy;
+    return *this;
+}
+
 SurfaceComposerClient::Transaction& SurfaceComposerClient::Transaction::setFixedTransformHint(
         const sp<SurfaceControl>& sc, int32_t fixedTransformHint) {
     layer_state_t* s = getLayerState(sc);
@@ -2279,25 +2323,11 @@ void SurfaceComposerClient::Transaction::mergeFrameTimelineInfo(FrameTimelineInf
     if (t.vsyncId != FrameTimelineInfo::INVALID_VSYNC_ID &&
         other.vsyncId != FrameTimelineInfo::INVALID_VSYNC_ID) {
         if (other.vsyncId > t.vsyncId) {
-            t.vsyncId = other.vsyncId;
-            t.inputEventId = other.inputEventId;
-            t.startTimeNanos = other.startTimeNanos;
-            t.useForRefreshRateSelection = other.useForRefreshRateSelection;
+            t = other;
         }
     } else if (t.vsyncId == FrameTimelineInfo::INVALID_VSYNC_ID) {
-        t.vsyncId = other.vsyncId;
-        t.inputEventId = other.inputEventId;
-        t.startTimeNanos = other.startTimeNanos;
-        t.useForRefreshRateSelection = other.useForRefreshRateSelection;
+        t = other;
     }
-}
-
-// copied from FrameTimelineInfo::clear()
-void SurfaceComposerClient::Transaction::clearFrameTimelineInfo(FrameTimelineInfo& t) {
-    t.vsyncId = FrameTimelineInfo::INVALID_VSYNC_ID;
-    t.inputEventId = os::IInputConstants::INVALID_INPUT_EVENT_ID;
-    t.startTimeNanos = 0;
-    t.useForRefreshRateSelection = false;
 }
 
 SurfaceComposerClient::Transaction&
@@ -2420,7 +2450,7 @@ status_t SurfaceComposerClient::createSurfaceChecked(const String8& name, uint32
 
     if (mStatus == NO_ERROR) {
         gui::CreateSurfaceResult result;
-        binder::Status status = mClient->createSurface(std::string(name.string()), flags,
+        binder::Status status = mClient->createSurface(std::string(name.c_str()), flags,
                                                        parentHandle, std::move(metadata), &result);
         err = statusTFromBinderStatus(status);
         if (outTransformHint) {
@@ -2523,38 +2553,41 @@ status_t SurfaceComposerClient::getStaticDisplayInfo(int64_t displayId,
         outInfo->secure = ginfo.secure;
         outInfo->installOrientation = static_cast<ui::Rotation>(ginfo.installOrientation);
 
-        DeviceProductInfo info;
-        std::optional<gui::DeviceProductInfo> dpi = ginfo.deviceProductInfo;
-        gui::DeviceProductInfo::ManufactureOrModelDate& date = dpi->manufactureOrModelDate;
-        info.name = dpi->name;
-        if (dpi->manufacturerPnpId.size() > 0) {
-            // copid from PnpId = std::array<char, 4> in ui/DeviceProductInfo.h
-            constexpr int kMaxPnpIdSize = 4;
-            size_t count = std::max<size_t>(kMaxPnpIdSize, dpi->manufacturerPnpId.size());
-            std::copy_n(dpi->manufacturerPnpId.begin(), count, info.manufacturerPnpId.begin());
-        }
-        if (dpi->relativeAddress.size() > 0) {
-            std::copy(dpi->relativeAddress.begin(), dpi->relativeAddress.end(),
-                      std::back_inserter(info.relativeAddress));
-        }
-        info.productId = dpi->productId;
-        if (date.getTag() == Tag::modelYear) {
-            DeviceProductInfo::ModelYear modelYear;
-            modelYear.year = static_cast<uint32_t>(date.get<Tag::modelYear>().year);
-            info.manufactureOrModelDate = modelYear;
-        } else if (date.getTag() == Tag::manufactureYear) {
-            DeviceProductInfo::ManufactureYear manufactureYear;
-            manufactureYear.year = date.get<Tag::manufactureYear>().modelYear.year;
-            info.manufactureOrModelDate = manufactureYear;
-        } else if (date.getTag() == Tag::manufactureWeekAndYear) {
-            DeviceProductInfo::ManufactureWeekAndYear weekAndYear;
-            weekAndYear.year =
-                    date.get<Tag::manufactureWeekAndYear>().manufactureYear.modelYear.year;
-            weekAndYear.week = date.get<Tag::manufactureWeekAndYear>().week;
-            info.manufactureOrModelDate = weekAndYear;
-        }
+        if (const std::optional<gui::DeviceProductInfo> dpi = ginfo.deviceProductInfo) {
+            DeviceProductInfo info;
+            info.name = dpi->name;
+            if (dpi->manufacturerPnpId.size() > 0) {
+                // copid from PnpId = std::array<char, 4> in ui/DeviceProductInfo.h
+                constexpr int kMaxPnpIdSize = 4;
+                size_t count = std::max<size_t>(kMaxPnpIdSize, dpi->manufacturerPnpId.size());
+                std::copy_n(dpi->manufacturerPnpId.begin(), count, info.manufacturerPnpId.begin());
+            }
+            if (dpi->relativeAddress.size() > 0) {
+                std::copy(dpi->relativeAddress.begin(), dpi->relativeAddress.end(),
+                          std::back_inserter(info.relativeAddress));
+            }
+            info.productId = dpi->productId;
 
-        outInfo->deviceProductInfo = info;
+            const gui::DeviceProductInfo::ManufactureOrModelDate& date =
+                    dpi->manufactureOrModelDate;
+            if (date.getTag() == Tag::modelYear) {
+                DeviceProductInfo::ModelYear modelYear;
+                modelYear.year = static_cast<uint32_t>(date.get<Tag::modelYear>().year);
+                info.manufactureOrModelDate = modelYear;
+            } else if (date.getTag() == Tag::manufactureYear) {
+                DeviceProductInfo::ManufactureYear manufactureYear;
+                manufactureYear.year = date.get<Tag::manufactureYear>().modelYear.year;
+                info.manufactureOrModelDate = manufactureYear;
+            } else if (date.getTag() == Tag::manufactureWeekAndYear) {
+                DeviceProductInfo::ManufactureWeekAndYear weekAndYear;
+                weekAndYear.year =
+                        date.get<Tag::manufactureWeekAndYear>().manufactureYear.modelYear.year;
+                weekAndYear.week = date.get<Tag::manufactureWeekAndYear>().week;
+                info.manufactureOrModelDate = weekAndYear;
+            }
+
+            outInfo->deviceProductInfo = info;
+        }
     }
     return statusTFromBinderStatus(status);
 }
@@ -2571,7 +2604,8 @@ void SurfaceComposerClient::getDynamicDisplayInfoInternal(gui::DynamicDisplayInf
         outMode.resolution.height = mode.resolution.height;
         outMode.xDpi = mode.xDpi;
         outMode.yDpi = mode.yDpi;
-        outMode.refreshRate = mode.refreshRate;
+        outMode.peakRefreshRate = mode.peakRefreshRate;
+        outMode.vsyncRate = mode.vsyncRate;
         outMode.appVsyncOffset = mode.appVsyncOffset;
         outMode.sfVsyncOffset = mode.sfVsyncOffset;
         outMode.presentationDeadline = mode.presentationDeadline;
@@ -2748,9 +2782,30 @@ status_t SurfaceComposerClient::getHdrOutputConversionSupport(bool* isSupported)
     return statusTFromBinderStatus(status);
 }
 
-status_t SurfaceComposerClient::setOverrideFrameRate(uid_t uid, float frameRate) {
+status_t SurfaceComposerClient::setGameModeFrameRateOverride(uid_t uid, float frameRate) {
     binder::Status status =
-            ComposerServiceAIDL::getComposerService()->setOverrideFrameRate(uid, frameRate);
+            ComposerServiceAIDL::getComposerService()->setGameModeFrameRateOverride(uid, frameRate);
+    return statusTFromBinderStatus(status);
+}
+
+status_t SurfaceComposerClient::setGameDefaultFrameRateOverride(uid_t uid, float frameRate) {
+    binder::Status status =
+            ComposerServiceAIDL::getComposerService()->setGameDefaultFrameRateOverride(uid,
+                                                                                       frameRate);
+    return statusTFromBinderStatus(status);
+}
+
+status_t SurfaceComposerClient::updateSmallAreaDetection(std::vector<int32_t>& appIds,
+                                                         std::vector<float>& thresholds) {
+    binder::Status status =
+            ComposerServiceAIDL::getComposerService()->updateSmallAreaDetection(appIds, thresholds);
+    return statusTFromBinderStatus(status);
+}
+
+status_t SurfaceComposerClient::setSmallAreaDetectionThreshold(int32_t appId, float threshold) {
+    binder::Status status =
+            ComposerServiceAIDL::getComposerService()->setSmallAreaDetectionThreshold(appId,
+                                                                                      threshold);
     return statusTFromBinderStatus(status);
 }
 
@@ -3074,12 +3129,12 @@ status_t ScreenshotClient::captureDisplay(const DisplayCaptureArgs& captureArgs,
     return statusTFromBinderStatus(status);
 }
 
-status_t ScreenshotClient::captureDisplay(DisplayId displayId,
+status_t ScreenshotClient::captureDisplay(DisplayId displayId, const gui::CaptureArgs& captureArgs,
                                           const sp<IScreenCaptureListener>& captureListener) {
     sp<gui::ISurfaceComposer> s(ComposerServiceAIDL::getComposerService());
     if (s == nullptr) return NO_INIT;
 
-    binder::Status status = s->captureDisplayById(displayId.value, captureListener);
+    binder::Status status = s->captureDisplayById(displayId.value, captureArgs, captureListener);
     return statusTFromBinderStatus(status);
 }
 

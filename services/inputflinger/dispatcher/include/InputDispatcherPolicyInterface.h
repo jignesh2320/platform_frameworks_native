@@ -18,18 +18,21 @@
 
 #include "InputDispatcherConfiguration.h"
 
+#include <android-base/properties.h>
 #include <binder/IBinder.h>
 #include <gui/InputApplication.h>
+#include <gui/PidUid.h>
 #include <input/Input.h>
+#include <input/InputDevice.h>
 #include <utils/RefBase.h>
+#include <set>
 
 namespace android {
-
 
 /*
  * Input dispatcher policy interface.
  *
- * The input reader policy is used by the input reader to interact with the Window Manager
+ * The input dispatcher policy is used by the input dispatcher to interact with the Window Manager
  * and other system components.
  *
  * The actual implementation is partially supported by callbacks into the DVM
@@ -53,7 +56,7 @@ public:
      * pid of the owner. The string reason contains information about the input event that we
      * haven't received a response for.
      */
-    virtual void notifyWindowUnresponsive(const sp<IBinder>& token, std::optional<int32_t> pid,
+    virtual void notifyWindowUnresponsive(const sp<IBinder>& token, std::optional<gui::Pid> pid,
                                           const std::string& reason) = 0;
 
     /* Notifies the system that a window just became responsive. This is only called after the
@@ -61,7 +64,7 @@ public:
      * no longer should be shown to the user. The window is eligible to cause a new ANR in the
      * future.
      */
-    virtual void notifyWindowResponsive(const sp<IBinder>& token, std::optional<int32_t> pid) = 0;
+    virtual void notifyWindowResponsive(const sp<IBinder>& token, std::optional<gui::Pid> pid) = 0;
 
     /* Notifies the system that an input channel is unrecoverably broken. */
     virtual void notifyInputChannelBroken(const sp<IBinder>& token) = 0;
@@ -72,9 +75,6 @@ public:
     virtual void notifySensorAccuracy(int32_t deviceId, InputDeviceSensorType sensorType,
                                       InputDeviceSensorAccuracy accuracy) = 0;
     virtual void notifyVibratorState(int32_t deviceId, bool isOn) = 0;
-
-    /* Gets the input dispatcher configuration. */
-    virtual InputDispatcherConfiguration getDispatcherConfiguration() = 0;
 
     /* Filters an input event.
      * Return true to dispatch the event unmodified, false to consume the event.
@@ -122,6 +122,16 @@ public:
     virtual void pokeUserActivity(nsecs_t eventTime, int32_t eventType, int32_t displayId,
                                   int32_t keyCode) = 0;
 
+    /*
+     * Return true if the provided event is stale, and false otherwise. Used for determining
+     * whether the dispatcher should drop the event.
+     */
+    virtual bool isStaleEvent(nsecs_t currentTime, nsecs_t eventTime) {
+        static const std::chrono::duration STALE_EVENT_TIMEOUT =
+                std::chrono::seconds(10) * android::base::HwTimeoutMultiplier();
+        return std::chrono::nanoseconds(currentTime - eventTime) >= STALE_EVENT_TIMEOUT;
+    }
+
     /* Notifies the policy that a pointer down event has occurred outside the current focused
      * window.
      *
@@ -137,6 +147,10 @@ public:
 
     /* Notifies the policy that the drag window has moved over to another window */
     virtual void notifyDropWindow(const sp<IBinder>& token, float x, float y) = 0;
+
+    /* Notifies the policy that there was an input device interaction with apps. */
+    virtual void notifyDeviceInteraction(DeviceId deviceId, nsecs_t timestamp,
+                                         const std::set<gui::Uid>& uids) = 0;
 };
 
 } // namespace android

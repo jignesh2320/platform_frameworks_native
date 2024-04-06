@@ -25,6 +25,11 @@
 namespace android {
 namespace {
 
+MATCHER_P(DisplayModeFps, value, "equals") {
+    using fps_approx_ops::operator==;
+    return arg->getVsyncRate() == value;
+}
+
 // Used when we simulate a display that supports doze.
 template <typename Display>
 struct DozeIsSupportedVariant {
@@ -61,31 +66,33 @@ struct DozeNotSupportedVariant {
 struct EventThreadBaseSupportedVariant {
     static void setupVsyncNoCallExpectations(DisplayTransactionTest* test) {
         // Expect no change to hardware nor synthetic VSYNC.
-        EXPECT_CALL(test->mFlinger.mockSchedulerCallback(), setVsyncEnabled(_, _)).Times(0);
+        EXPECT_CALL(test->mFlinger.scheduler()->mockRequestHardwareVsync, Call(_, _)).Times(0);
         EXPECT_CALL(*test->mEventThread, enableSyntheticVsync(_)).Times(0);
     }
 };
 
 struct EventThreadNotSupportedVariant : public EventThreadBaseSupportedVariant {
     static void setupEnableVsyncCallExpectations(DisplayTransactionTest* test) {
-        setupVsyncNoCallExpectations(test);
+        EXPECT_CALL(test->mFlinger.scheduler()->mockRequestHardwareVsync, Call(_, true)).Times(1);
+        EXPECT_CALL(*test->mEventThread, enableSyntheticVsync(_)).Times(0);
     }
 
     static void setupDisableVsyncCallExpectations(DisplayTransactionTest* test) {
-        setupVsyncNoCallExpectations(test);
+        EXPECT_CALL(test->mFlinger.scheduler()->mockRequestHardwareVsync, Call(_, false)).Times(1);
+        EXPECT_CALL(*test->mEventThread, enableSyntheticVsync(_)).Times(0);
     }
 };
 
 struct EventThreadIsSupportedVariant : public EventThreadBaseSupportedVariant {
     static void setupEnableVsyncCallExpectations(DisplayTransactionTest* test) {
         // Expect to enable hardware VSYNC and disable synthetic VSYNC.
-        EXPECT_CALL(test->mFlinger.mockSchedulerCallback(), setVsyncEnabled(_, true)).Times(1);
+        EXPECT_CALL(test->mFlinger.scheduler()->mockRequestHardwareVsync, Call(_, true)).Times(1);
         EXPECT_CALL(*test->mEventThread, enableSyntheticVsync(false)).Times(1);
     }
 
     static void setupDisableVsyncCallExpectations(DisplayTransactionTest* test) {
         // Expect to disable hardware VSYNC and enable synthetic VSYNC.
-        EXPECT_CALL(test->mFlinger.mockSchedulerCallback(), setVsyncEnabled(_, false)).Times(1);
+        EXPECT_CALL(test->mFlinger.scheduler()->mockRequestHardwareVsync, Call(_, false)).Times(1);
         EXPECT_CALL(*test->mEventThread, enableSyntheticVsync(true)).Times(1);
     }
 };
@@ -94,7 +101,8 @@ struct DispSyncIsSupportedVariant {
     static void setupResetModelCallExpectations(DisplayTransactionTest* test) {
         auto vsyncSchedule = test->mFlinger.scheduler()->getVsyncSchedule();
         EXPECT_CALL(static_cast<mock::VsyncController&>(vsyncSchedule->getController()),
-                    startPeriodTransition(DEFAULT_VSYNC_PERIOD, false))
+                    onDisplayModeChanged(DisplayModeFps(Fps::fromPeriodNsecs(DEFAULT_VSYNC_PERIOD)),
+                                         false))
                 .Times(1);
         EXPECT_CALL(static_cast<mock::VSyncTracker&>(vsyncSchedule->getTracker()), resetModel())
                 .Times(1);
@@ -292,6 +300,11 @@ using PrimaryDisplayPowerCase =
 // A sample configuration for the external display.
 // In addition to not having event thread support, we emulate not having doze
 // support.
+// TODO (b/267483230): ExternalDisplay supports the features tracked in
+// DispSyncIsSupportedVariant, but is the follower, so the
+// expectations set by DispSyncIsSupportedVariant don't match (wrong schedule).
+// We need a way to retrieve the proper DisplayId from
+// setupResetModelCallExpectations (or pass it in).
 template <typename TransitionVariant>
 using ExternalDisplayPowerCase =
         DisplayPowerCase<ExternalDisplayVariant, DozeNotSupportedVariant<ExternalDisplayVariant>,

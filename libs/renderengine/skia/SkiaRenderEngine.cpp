@@ -22,6 +22,7 @@
 
 #include <GrBackendSemaphore.h>
 #include <GrContextOptions.h>
+#include <GrTypes.h>
 #include <SkBlendMode.h>
 #include <SkCanvas.h>
 #include <SkColor.h>
@@ -54,13 +55,14 @@
 #include <android-base/stringprintf.h>
 #include <gui/FenceMonitor.h>
 #include <gui/TraceUtils.h>
+#include <include/gpu/ganesh/SkSurfaceGanesh.h>
 #include <pthread.h>
 #include <src/core/SkTraceEventCommon.h>
 #include <sync/sync.h>
 #include <ui/BlurRegion.h>
-#include <ui/DataspaceUtils.h>
 #include <ui/DebugUtils.h>
 #include <ui/GraphicBuffer.h>
+#include <ui/HdrRenderTypeUtils.h>
 #include <utils/Trace.h>
 
 #include <cmath>
@@ -241,8 +243,8 @@ namespace skia {
 
 using base::StringAppendF;
 
-std::future<void> SkiaRenderEngine::primeCache() {
-    Cache::primeShaderCache(this);
+std::future<void> SkiaRenderEngine::primeCache(bool shouldPrimeUltraHDR) {
+    Cache::primeShaderCache(this, shouldPrimeUltraHDR);
     return {};
 }
 
@@ -268,10 +270,8 @@ void SkiaRenderEngine::setEnableTracing(bool tracingEnabled) {
 }
 
 SkiaRenderEngine::SkiaRenderEngine(RenderEngineType type, PixelFormat pixelFormat,
-                                   bool useColorManagement, bool supportsBackgroundBlur)
-      : RenderEngine(type),
-        mDefaultPixelFormat(pixelFormat),
-        mUseColorManagement(useColorManagement) {
+                                   bool supportsBackgroundBlur)
+      : RenderEngine(type), mDefaultPixelFormat(pixelFormat) {
     if (supportsBackgroundBlur) {
         ALOGD("Background Blurs Enabled");
         mBlurFilter = new KawaseBlurFilter();
@@ -290,12 +290,12 @@ void SkiaRenderEngine::finishRenderingAndAbandonContext() {
     }
 
     if (mGrContext) {
-        mGrContext->flushAndSubmit(true);
+        mGrContext->flushAndSubmit(GrSyncCpu::kYes);
         mGrContext->abandonContext();
     }
 
     if (mProtectedGrContext) {
-        mProtectedGrContext->flushAndSubmit(true);
+        mProtectedGrContext->flushAndSubmit(GrSyncCpu::kYes);
         mProtectedGrContext->abandonContext();
     }
 }
@@ -308,7 +308,7 @@ void SkiaRenderEngine::useProtectedContext(bool useProtectedContext) {
 
     // release any scratch resources before switching into a new mode
     if (getActiveGrContext()) {
-        getActiveGrContext()->purgeUnlockedResources(true);
+        getActiveGrContext()->purgeUnlockedResources(GrPurgeResourceOptions::kScratchResourcesOnly);
     }
 
     // Backend-specific way to switch to protected context
@@ -400,7 +400,14 @@ void SkiaRenderEngine::mapExternalTextureBuffer(const sp<GraphicBuffer>& buffer,
     // simply match the existing behavior for protected buffers.)  We also never cache any
     // buffers while in a protected context.
     const bool isProtectedBuffer = buffer->getUsage() & GRALLOC_USAGE_PROTECTED;
+<<<<<<< HEAD
     if (isProtectedBuffer || isProtected()) {
+=======
+    // Don't attempt to map buffers if we're not gpu sampleable. Callers shouldn't send a buffer
+    // over to RenderEngine.
+    const bool isGpuSampleable = buffer->getUsage() & GRALLOC_USAGE_HW_TEXTURE;
+    if (isProtectedBuffer || isProtected() || !isGpuSampleable) {
+>>>>>>> android-14.0.0_r31
         return;
     }
     ATRACE_CALL();
@@ -648,8 +655,7 @@ private:
 void SkiaRenderEngine::drawLayersInternal(
         const std::shared_ptr<std::promise<FenceResult>>&& resultPromise,
         const DisplaySettings& display, const std::vector<LayerSettings>& layers,
-        const std::shared_ptr<ExternalTexture>& buffer, const bool /*useFramebufferCache*/,
-        base::unique_fd&& bufferFence) {
+        const std::shared_ptr<ExternalTexture>& buffer, base::unique_fd&& bufferFence) {
     ATRACE_FORMAT("%s for %s", __func__, display.namePlusId.c_str());
 
     std::lock_guard<std::mutex> lock(mRenderingMutex);
@@ -663,6 +669,8 @@ void SkiaRenderEngine::drawLayersInternal(
     validateOutputBufferUsage(buffer->getBuffer());
 
     auto grContext = getActiveGrContext();
+    LOG_ALWAYS_FATAL_IF(grContext->abandoned(), "GrContext is abandoned/device lost at start of %s",
+                        __func__);
 
     // any AutoBackendTexture deletions will now be deferred until cleanupPostRender is called
     DeferTextureCleanup dtc(mTextureCleanupMgr);
@@ -917,8 +925,7 @@ void SkiaRenderEngine::drawLayersInternal(
         // luminance in linear space, which color pipelines request GAMMA_OETF break
         // without a gamma 2.2 fixup.
         const bool requiresLinearEffect = layer.colorTransform != mat4() ||
-                (mUseColorManagement &&
-                 needsToneMapping(layer.sourceDataspace, display.outputDataspace)) ||
+                (needsToneMapping(layer.sourceDataspace, display.outputDataspace)) ||
                 (dimInLinearSpace && !equalsWithinMargin(1.f, layerDimmingRatio)) ||
                 (!dimInLinearSpace && isExtendedHdr);
 
@@ -929,10 +936,7 @@ void SkiaRenderEngine::drawLayersInternal(
             continue;
         }
 
-        // If color management is disabled, then mark the source image with the same colorspace as
-        // the destination surface so that Skia's color management is a no-op.
-        const ui::Dataspace layerDataspace =
-                !mUseColorManagement ? display.outputDataspace : layer.sourceDataspace;
+        const ui::Dataspace layerDataspace = layer.sourceDataspace;
 
         SkPaint paint;
         if (layer.source.buffer.buffer) {
@@ -1022,7 +1026,10 @@ void SkiaRenderEngine::drawLayersInternal(
             // Most HDR standards require at least 10-bits of color depth for source content, so we
             // can just extract the transfer function rather than dig into precise gralloc layout.
             // Furthermore, we can assume that the only 8-bit target we support is RGBA8888.
-            const bool requiresDownsample = isHdrDataspace(layer.sourceDataspace) &&
+            const bool requiresDownsample =
+                    getHdrRenderType(layer.sourceDataspace,
+                                     std::optional<ui::PixelFormat>(static_cast<ui::PixelFormat>(
+                                             buffer->getPixelFormat()))) != HdrRenderType::SDR &&
                     buffer->getPixelFormat() == PIXEL_FORMAT_RGBA_8888;
             if (layerDimmingRatio <= kDimmingThreshold || requiresDownsample) {
                 paint.setDither(true);
@@ -1121,7 +1128,7 @@ void SkiaRenderEngine::drawLayersInternal(
         }
         if (kFlushAfterEveryLayer) {
             ATRACE_NAME("flush surface");
-            activeSurface->flush();
+            skgpu::ganesh::Flush(activeSurface);
         }
     }
     for (const auto& borderRenderInfo : display.borderInfoList) {
@@ -1149,7 +1156,7 @@ void SkiaRenderEngine::drawLayersInternal(
     {
         ATRACE_NAME("flush surface");
         LOG_ALWAYS_FATAL_IF(activeSurface != dstSurface);
-        activeSurface->flush();
+        skgpu::ganesh::Flush(activeSurface);
     }
 
     auto drawFence = sp<Fence>::make(flushAndSubmit(grContext));

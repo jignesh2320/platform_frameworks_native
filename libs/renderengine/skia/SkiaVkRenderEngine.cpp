@@ -25,6 +25,7 @@
 #include <GrContextOptions.h>
 #include <vk/GrVkExtensions.h>
 #include <vk/GrVkTypes.h>
+#include <include/gpu/ganesh/vk/GrVkDirectContext.h>
 
 #include <android-base/stringprintf.h>
 #include <gui/TraceUtils.h>
@@ -263,7 +264,7 @@ VulkanInterface initVulkanInterface(bool protectedContent = false) {
     VK_GET_INST_PROC(instance, EnumerateDeviceExtensionProperties);
     VK_GET_INST_PROC(instance, GetPhysicalDeviceProperties2);
     VK_GET_INST_PROC(instance, GetPhysicalDeviceExternalSemaphoreProperties);
-    VK_GET_INST_PROC(instance, GetPhysicalDeviceQueueFamilyProperties);
+    VK_GET_INST_PROC(instance, GetPhysicalDeviceQueueFamilyProperties2);
     VK_GET_INST_PROC(instance, GetPhysicalDeviceFeatures2);
     VK_GET_INST_PROC(instance, CreateDevice);
 
@@ -342,17 +343,37 @@ VulkanInterface initVulkanInterface(bool protectedContent = false) {
     }
 
     uint32_t queueCount;
-    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueCount, nullptr);
+    vkGetPhysicalDeviceQueueFamilyProperties2(physicalDevice, &queueCount, nullptr);
     if (queueCount == 0) {
         BAIL("Could not find queues for physical device");
     }
 
-    std::vector<VkQueueFamilyProperties> queueProps(queueCount);
-    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueCount, queueProps.data());
+    std::vector<VkQueueFamilyProperties2> queueProps(queueCount);
+    std::vector<VkQueueFamilyGlobalPriorityPropertiesEXT> queuePriorityProps(queueCount);
+    VkQueueGlobalPriorityKHR queuePriority = VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
+    // Even though we don't yet know if the VK_EXT_global_priority extension is available,
+    // we can safely add the request to the pNext chain, and if the extension is not
+    // available, it will be ignored.
+    for (uint32_t i = 0; i < queueCount; ++i) {
+        queuePriorityProps[i].sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_GLOBAL_PRIORITY_PROPERTIES_EXT;
+        queuePriorityProps[i].pNext = nullptr;
+        queueProps[i].pNext = &queuePriorityProps[i];
+    }
+    vkGetPhysicalDeviceQueueFamilyProperties2(physicalDevice, &queueCount, queueProps.data());
 
     int graphicsQueueIndex = -1;
     for (uint32_t i = 0; i < queueCount; ++i) {
-        if (queueProps[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+        // Look at potential answers to the VK_EXT_global_priority query.  If answers were
+        // provided, we may adjust the queuePriority.
+        if (queueProps[i].queueFamilyProperties.queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+            for (uint32_t j = 0; j < queuePriorityProps[i].priorityCount; j++) {
+                if (queuePriorityProps[i].priorities[j] > queuePriority) {
+                    queuePriority = queuePriorityProps[i].priorities[j];
+                }
+            }
+            if (queuePriority == VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR) {
+                interface.isRealtimePriority = true;
+            }
             graphicsQueueIndex = i;
             break;
         }
@@ -412,6 +433,10 @@ VulkanInterface initVulkanInterface(bool protectedContent = false) {
     // Looks like this would slow things down and we can't depend on it on all platforms
     interface.physicalDeviceFeatures2->features.robustBufferAccess = VK_FALSE;
 
+    if (protectedContent && !interface.protectedMemoryFeatures->protectedMemory) {
+        BAIL("Protected memory not supported");
+    }
+
     float queuePriorities[1] = {0.0f};
     void* queueNextPtr = nullptr;
 
@@ -419,12 +444,11 @@ VulkanInterface initVulkanInterface(bool protectedContent = false) {
             VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_EXT,
             nullptr,
             // If queue priority is supported, RE should always have realtime priority.
-            VK_QUEUE_GLOBAL_PRIORITY_REALTIME_EXT,
+            queuePriority,
     };
 
     if (interface.grExtensions.hasExtension(VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME, 2)) {
         queueNextPtr = &queuePriorityCreateInfo;
-        interface.isRealtimePriority = true;
     }
 
     VkDeviceQueueCreateFlags deviceQueueCreateFlags =
@@ -573,7 +597,7 @@ std::unique_ptr<SkiaVkRenderEngine> SkiaVkRenderEngine::create(
 
 SkiaVkRenderEngine::SkiaVkRenderEngine(const RenderEngineCreationArgs& args)
       : SkiaRenderEngine(args.renderEngineType, static_cast<PixelFormat>(args.pixelFormat),
-                         args.useColorManagement, args.supportsBackgroundBlur) {}
+                         args.supportsBackgroundBlur) {}
 
 SkiaVkRenderEngine::~SkiaVkRenderEngine() {
     finishRenderingAndAbandonContext();
@@ -584,11 +608,11 @@ SkiaRenderEngine::Contexts SkiaVkRenderEngine::createDirectContexts(
     sSetupVulkanInterface();
 
     SkiaRenderEngine::Contexts contexts;
-    contexts.first = GrDirectContext::MakeVulkan(sVulkanInterface.getBackendContext(), options);
+    contexts.first = GrDirectContexts::MakeVulkan(sVulkanInterface.getBackendContext(), options);
     if (supportsProtectedContentImpl()) {
         contexts.second =
-                GrDirectContext::MakeVulkan(sProtectedContentVulkanInterface.getBackendContext(),
-                                            options);
+                GrDirectContexts::MakeVulkan(sProtectedContentVulkanInterface.getBackendContext(),
+                                             options);
     }
 
     return contexts;
@@ -662,7 +686,7 @@ base::unique_fd SkiaVkRenderEngine::flushAndSubmit(GrDirectContext* grContext) {
         flushInfo.fFinishedContext = destroySemaphoreInfo;
     }
     GrSemaphoresSubmitted submitted = grContext->flush(flushInfo);
-    grContext->submit(false /* no cpu sync */);
+    grContext->submit(GrSyncCpu::kNo);
     int drawFenceFd = -1;
     if (semaphore != VK_NULL_HANDLE) {
         if (GrSemaphoresSubmitted::kYes == submitted) {

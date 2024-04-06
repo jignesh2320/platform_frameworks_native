@@ -201,6 +201,7 @@ class PropertiesHelper {
 #if !defined(__ANDROID_VNDK__)
     static bool IsStrictRun();
 #endif
+    static bool IsStrictRun();
 
   private:
     static std::string build_type_;
@@ -210,6 +211,7 @@ class PropertiesHelper {
 #if !defined(__ANDROID_VNDK__)
     static int strict_run_;
 #endif
+    static int strict_run_;
 };
 
 /*
